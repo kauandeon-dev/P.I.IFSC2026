@@ -1,0 +1,31 @@
+# Serviço systemd do Sentinela.
+# Copie para /etc/systemd/system/sentinela.service e ajuste os caminhos.
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sentinela
+[Unit]
+Description=Sentinela - Backup automatizado de bancos de dados
+After=network-online.target postgresql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinela
+Group=sentinela
+WorkingDirectory=/opt/sentinela
+Environment=SENTINELA_HOME=/var/lib/sentinela
+Environment=SENTINELA_BACKUP_DIR=/var/backups/sentinela
+Environment=SENTINELA_BIND=127.0.0.1
+Environment=SENTINELA_PORT=8080
+ExecStart=/opt/sentinela/.venv/bin/python -m sentinela serve
+Restart=on-failure
+UMask=0077
+
+# Endurecimento
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sentinela /var/backups/sentinela
+
+[Install]
+WantedBy=multi-user.target
