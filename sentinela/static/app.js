@@ -146,7 +146,7 @@
       if (S.route === 'logs') tasks.push(api('GET', '/api/logs?limit=30').then((d) => { S.logs = d.executions; }));
       await Promise.all(tasks);
       if (S.route === 'policy' && !S.policyDraft) S.policyDraft = Object.assign({}, S.data.policy);
-      if (S.route === 'conn' && !S.connDraft) S.connDraft = Object.assign({ password: '' }, S.data.connection, { directory: S.data.policy.directory });
+      if (S.route === 'conn' && !S.connDraft) S.connDraft = newConnDraft(S.data.connection, S.data.policy.directory);
     } catch (e) {
       if (S.user) toast(e.message, true);
     }
@@ -338,6 +338,7 @@
             <div class="col" style="gap:11px">
               <div class="kv"><span>SGBD</span><span>${esc(d.connection.sgbd_label)}</span></div>
               <div class="kv"><span>Banco</span><span class="mono">${esc(d.connection.dbname || '—')}</span></div>
+              <div class="kv"><span>Acesso</span><span>${d.connection.ssh && d.connection.ssh.enabled ? 'Túnel SSH · ' + esc(d.connection.ssh.host) : 'Direto'}</span></div>
               <div class="kv"><span>Agendamento</span><span>${sched}</span></div>
               <div class="kv"><span>Criptografia</span><span>${p.encryption ? 'AES-256 · ativa' : 'Desativada'}</span></div>
               <div class="kv"><span>Compressão</span><span>${p.compression ? 'gzip · ativa' : 'Desativada'}</span></div>
@@ -497,11 +498,12 @@
   // ---------------------------------------------------------------- conexão
   function viewConn() {
     const c = S.connDraft || S.data.connection;
+    const sh = c.ssh || {};
     const seg = (on, act, label) => `<div class="${on ? 'on' : ''}" data-action="${act}">${label}</div>`;
     const t = S.test;
     let testMsg = '';
     if (t.status === 'testing') testMsg = `<span class="test-run">${I.spinner()}Testando…</span>`;
-    if (t.status === 'ok') testMsg = `<span class="test-ok">${I.check('#22a565', 15)}Conexão bem-sucedida · ${esc(t.version)}</span>`;
+    if (t.status === 'ok') testMsg = `<span class="test-ok">${I.check('#22a565', 15)}Conexão bem-sucedida · ${esc(t.version)}${sh.enabled ? ' · via SSH' : ''}</span>`;
     if (t.status === 'error') testMsg = `<span class="test-err">${I.x}${esc(t.error)}</span>`;
     const f = (id, label, val, type = 'text', ph = '') => `<div><label class="lbl" for="${id}">${label}</label><input class="input sm mono" id="${id}" type="${type}" value="${esc(val)}" placeholder="${esc(ph)}" spellcheck="false" autocomplete="off"></div>`;
     return `<div class="narrow-sm">
@@ -509,6 +511,13 @@
       <div class="card pad-lg mb16">
         <div class="lbl" style="margin-bottom:10px">Gerenciador (SGBD)</div>
         <div class="seg full mb20">${seg(c.sgbd === 'postgres', 'sgbd-postgres', 'PostgreSQL')}${seg(c.sgbd === 'mariadb', 'sgbd-mariadb', 'MariaDB (MySQL)')}</div>
+        <div class="lbl" style="margin-bottom:10px">Forma de acesso</div>
+        <div class="seg full">${seg(!sh.enabled, 'ssh-off', 'Conexão direta')}${seg(sh.enabled, 'ssh-on', 'Túnel SSH')}</div>
+        ${sh.enabled ? viewSsh(sh, f, seg) : '<div class="hint">O Sentinela conecta direto na porta do banco. Use o túnel SSH quando o banco estiver em outro servidor e a porta dele não estiver exposta.</div>'}
+      </div>
+      <div class="card pad-lg mb16">
+        <div class="card-title">Banco de dados</div>
+        <div class="card-sub">${sh.enabled ? 'Host e porta do banco <strong>vistos a partir do servidor SSH</strong> — normalmente <span class="mono">localhost</span>.' : 'Endereço do servidor de banco de dados.'}</div>
         <div class="g21 mb16">${f('c-host', 'Host', c.host)}${f('c-port', 'Porta', c.port)}</div>
         <div class="mb16">${f('c-dbname', 'Nome do banco', c.dbname, 'text', 'ex.: loja_producao')}</div>
         <div class="g2 mb20">${f('c-user', 'Usuário', c.user)}${f('c-password', 'Senha', c.password || '', 'password', S.data.connection.has_password ? '•••••••• (mantida)' : '')}</div>
@@ -526,11 +535,35 @@
     </div>`;
   }
 
+  function viewSsh(sh, f, seg) {
+    const saved = S.data.connection.ssh || {};
+    const keep = (has) => (has ? '•••••••• (mantida)' : '');
+    const hostKey = sh.host_key
+      ? `<div class="hint">Chave do servidor registrada: <span class="mono">${esc(sh.host_key)}</span> · <a data-action="ssh-reset">redefinir</a></div>`
+      : '<div class="hint">A impressão digital do servidor SSH será registrada na primeira conexão; se ela mudar depois, a conexão é bloqueada.</div>';
+    const auth = sh.auth === 'key'
+      ? `<div class="mb16"><label class="lbl" for="s-private_key">Chave privada</label>
+           <textarea class="input mono" id="s-private_key" rows="5" spellcheck="false" placeholder="${saved.has_private_key ? 'Chave mantida — cole outra para substituir' : '-----BEGIN OPENSSH PRIVATE KEY-----'}">${esc(sh.private_key || '')}</textarea></div>
+         ${f('s-key_passphrase', 'Senha da chave (se houver)', sh.key_passphrase || '', 'password', keep(saved.has_passphrase))}`
+      : f('s-password', 'Senha SSH', sh.password || '', 'password', keep(saved.has_password));
+    return `<div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--line-2)">
+        <div class="g21 mb16">${f('s-host', 'Servidor SSH', sh.host, 'text', 'ex.: 200.100.50.10')}${f('s-port', 'Porta SSH', sh.port || '22')}</div>
+        <div class="mb16">${f('s-user', 'Usuário SSH', sh.user, 'text', 'ex.: backup')}</div>
+        <div class="lbl" style="margin-bottom:10px">Autenticação</div>
+        <div class="seg mb16">${seg(sh.auth !== 'key', 'ssh-auth-password', 'Senha')}${seg(sh.auth === 'key', 'ssh-auth-key', 'Chave privada')}</div>
+        ${auth}
+        ${hostKey}
+      </div>`;
+  }
+
   // Lê os campos da tela de conexão para o rascunho (sem re-renderizar).
   function readConn() {
     const d = S.connDraft; if (!d) return;
     ['host', 'port', 'dbname', 'user', 'password', 'directory'].forEach((k) => {
       const el = document.getElementById('c-' + k); if (el) d[k] = el.value;
+    });
+    ['host', 'port', 'user', 'password', 'private_key', 'key_passphrase'].forEach((k) => {
+      const el = document.getElementById('s-' + k); if (el) d.ssh[k] = el.value;
     });
   }
   function readPolicy() {
@@ -585,11 +618,20 @@
     },
     'sgbd-postgres'() { setSgbd('postgres'); },
     'sgbd-mariadb'() { setSgbd('mariadb'); },
+    'ssh-on'() { readConn(); S.connDraft.ssh.enabled = true; S.test = { status: 'idle' }; render(); },
+    'ssh-off'() { readConn(); S.connDraft.ssh.enabled = false; S.test = { status: 'idle' }; render(); },
+    'ssh-auth-password'() { readConn(); S.connDraft.ssh.auth = 'password'; render(); },
+    'ssh-auth-key'() { readConn(); S.connDraft.ssh.auth = 'key'; render(); },
+    'ssh-reset'() {
+      readConn(); S.connDraft.ssh.reset_host_key = true; S.connDraft.ssh.host_key = null; render();
+      toast('A chave do servidor será registrada de novo na próxima conexão');
+    },
     async 'conn-test'() {
       readConn(); S.test = { status: 'testing' }; render();
       try {
         const r = await api('POST', '/api/connection/test', S.connDraft);
         S.test = r.ok ? { status: 'ok', version: r.version } : { status: 'error', error: r.error };
+        if (r.ok && r.ssh_host_key) S.connDraft.ssh.host_key = r.ssh_host_key;
       } catch (e) { S.test = { status: 'error', error: e.message }; }
       render();
     },
@@ -598,7 +640,7 @@
       try {
         const r = await api('PUT', '/api/connection', S.connDraft);
         S.data.connection = r.connection;
-        S.connDraft = Object.assign({}, r.connection, { password: '', directory: S.connDraft.directory });
+        S.connDraft = newConnDraft(r.connection, S.connDraft.directory);
         toast('Configurações de conexão salvas');
         await load();
       } catch (e) { toast(e.message, true); }
@@ -644,6 +686,11 @@
       });
     },
   };
+
+  function newConnDraft(conn, directory) {
+    const ssh = Object.assign({ password: '', private_key: '', key_passphrase: '' }, conn.ssh || {});
+    return Object.assign({}, conn, { password: '', directory, ssh });
+  }
 
   function setSgbd(s) {
     readConn();

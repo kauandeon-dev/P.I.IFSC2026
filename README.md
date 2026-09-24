@@ -14,6 +14,7 @@ Autor: Kauan V. Machado Deon
 | Agendamento automático | Diário à meia-noite **ou** a cada *N* dias (1–30), sem intervenção manual |
 | Retenção configurável (máx. 10 dias) | Exclusão automática das cópias expiradas (1–10 dias). A cópia válida mais recente nunca é apagada |
 | Dump PostgreSQL e MariaDB | `pg_dump` / `mariadb-dump` (ou `mysqldump`), escolhido pelo usuário |
+| Banco em outro servidor | Conexão direta ou **túnel SSH** (senha ou chave privada), com verificação da chave do host |
 | Criptografia | AES-256-GCM (confidencialidade + autenticação contra adulteração) |
 | Compressão | gzip, aplicada em fluxo antes da criptografia |
 | Armazenamento isolado (regra 3-2-1) | Diretório dedicado, fora da aplicação (validado). Pode apontar para disco externo, NFS/SMB etc. |
@@ -63,6 +64,26 @@ Para rodar como serviço, veja [`deploy/sentinela.service`](deploy/sentinela.ser
 
 > O painel escuta em `127.0.0.1` por padrão. Para acesso remoto, publique atrás
 > de um proxy reverso com HTTPS (nginx/Caddy) e defina `SENTINELA_HTTPS=1`.
+
+### Banco em outro servidor (túnel SSH)
+
+Na tela **Conexão**, em *Forma de acesso*, escolha **Túnel SSH** e informe o
+servidor, a porta e o usuário SSH, com **senha** ou **chave privada**
+(OpenSSH/PEM: ed25519, RSA ou ECDSA; senha da chave opcional).
+
+- Em **Host/Porta do banco**, informe o endereço **visto a partir do servidor
+  SSH** — normalmente `localhost` e `5432`/`3306`. A porta do banco não precisa
+  ficar exposta na internet.
+- O Sentinela abre um túnel (`127.0.0.1:porta-aleatória` → servidor SSH → banco)
+  a cada execução e o fecha ao terminar. Os clientes `pg_dump`/`mariadb-dump`
+  continuam rodando no servidor do Sentinela, e as cópias ficam nele.
+- Na primeira conexão, a impressão digital do servidor SSH (`SHA256:...`) é
+  registrada. Se ela mudar depois, backups e restaurações são bloqueados até a
+  chave ser redefinida no painel (proteção contra man-in-the-middle).
+- Senha SSH, chave privada e senha da chave são guardadas criptografadas.
+- Recomendado: criar no servidor do banco um usuário SSH só para o túnel, com
+  chave, e restringir no `authorized_keys`:
+  `restrict,port-forwarding,permitopen="localhost:5432" ssh-ed25519 AAAA...`
 
 ### Permissões mínimas do usuário de backup
 
@@ -115,6 +136,7 @@ Sem ela, as cópias criptografadas não podem ser recuperadas.
 sentinela/
   engine.py      backup, verificação, restauração, retenção, logs por execução
   dumpers.py     adaptadores PostgreSQL e MariaDB (pg_dump/psql, mariadb-dump/mariadb)
+  tunnel.py      túnel SSH (paramiko) com verificação da chave do host
   crypto.py      AES-256-GCM em fluxo, chave mestra, segredos
   scheduler.py   agendador (diário/intervalo) e limpeza
   storage.py     SQLite (configurações, histórico, logs)
@@ -136,6 +158,9 @@ Os testes de integração usam um PostgreSQL e um MariaDB locais com o banco
 estiverem disponíveis, são ignorados automaticamente. Cobrem: backup nas 4
 combinações de criptografia/compressão, detecção de adulteração, falha de
 conexão, restauração real (PostgreSQL e MariaDB), retenção e a CLI `decrypt`.
+`tests/test_ssh.py` usa um `sshd` de teste em `127.0.0.1:2222` (usuário `tunel`)
+para validar o túnel com senha, chave, chave protegida, senha errada, troca da
+chave do host e backup/restauração via SSH.
 
 ## Licença
 

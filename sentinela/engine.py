@@ -14,11 +14,12 @@ import subprocess
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from . import crypto, dumpers, settings, storage
+from . import crypto, dumpers, settings, storage, tunnel
 from .storage import iso, now
 
 log = logging.getLogger("sentinela")
@@ -42,6 +43,24 @@ DEFAULT_CONNECTION = {
     "user": "",
     "password_sealed": "",
 }
+
+# Túnel SSH opcional (banco em outro servidor). Com o túnel ativo, "host" e
+# "port" da conexão são o endereço do banco visto A PARTIR do servidor SSH.
+DEFAULT_SSH = {
+    "enabled": False,
+    "host": "",
+    "port": "22",
+    "user": "",
+    "auth": "password",            # password | key
+    "password_sealed": "",
+    "private_key_sealed": "",
+    "key_passphrase_sealed": "",
+    "host_key": None,              # {type, key, fingerprint} gravada na 1ª conexão
+}
+SSH_SECRETS = ("password", "private_key", "key_passphrase")
+
+# Chaves de host vistas em testes de conexão ainda não salvos: (host, porta) -> chave
+_seen_host_keys = {}
 
 TRIGGER_LABEL = {"auto": "automático", "manual": "manual", "pre-restore": "pré-restauração"}
 
@@ -117,9 +136,28 @@ def save_policy(data):
 def get_connection(with_password=False):
     c = dict(DEFAULT_CONNECTION)
     c.update(storage.get_setting("connection", {}) or {})
+    ssh = dict(DEFAULT_SSH)
+    ssh.update(c.get("ssh") or {})
+    c["ssh"] = ssh
     if with_password:
         c["password"] = crypto.unseal(key(), c.get("password_sealed", ""))
+        for f in SSH_SECRETS:
+            ssh[f] = crypto.unseal(key(), ssh.get(f + "_sealed", ""))
     return c
+
+
+def _apply_ssh_fields(ssh, data):
+    """Copia os campos não secretos do túnel SSH vindos do formulário."""
+    if "enabled" in data:
+        ssh["enabled"] = bool(data["enabled"])
+    for f in ("host", "port", "user"):
+        if f in data:
+            ssh[f] = str(data[f] or "").strip()
+    if data.get("auth") in ("password", "key"):
+        ssh["auth"] = data["auth"]
+    if ssh["port"] and not str(ssh["port"]).isdigit():
+        raise ValueError("Porta SSH inválida")
+    ssh["port"] = ssh["port"] or "22"
 
 
 def save_connection(data):
@@ -133,6 +171,32 @@ def save_connection(data):
         raise ValueError("Porta inválida")
     if data.get("password"):
         c["password_sealed"] = crypto.seal(key(), data["password"])
+    if isinstance(data.get("ssh"), dict):
+        d = data["ssh"]
+        ssh = c["ssh"]
+        before = (ssh["host"], str(ssh["port"]))
+        _apply_ssh_fields(ssh, d)
+        for f in SSH_SECRETS:
+            if d.get(f):
+                ssh[f + "_sealed"] = crypto.seal(key(), d[f])
+        if d.get("clear_private_key"):
+            ssh["private_key_sealed"] = ssh["key_passphrase_sealed"] = ""
+        target = (ssh["host"], str(ssh["port"]))
+        if target != before or d.get("reset_host_key"):
+            ssh["host_key"] = None
+        if ssh["host_key"] is None and target in _seen_host_keys:
+            ssh["host_key"] = _seen_host_keys.pop(target)
+        if ssh["enabled"]:
+            if not ssh["host"] or not ssh["user"]:
+                raise ValueError("Informe o servidor e o usuário SSH")
+            if ssh["auth"] == "key" and not ssh["private_key_sealed"]:
+                raise ValueError("Cole a chave privada SSH")
+            if ssh["auth"] == "key":
+                try:
+                    tunnel.load_private_key(crypto.unseal(key(), ssh["private_key_sealed"]),
+                                            crypto.unseal(key(), ssh["key_passphrase_sealed"]))
+                except tunnel.TunnelError as e:
+                    raise ValueError(str(e)) from e
     storage.set_setting("connection", c)
     if "directory" in data:
         save_policy({"directory": data["directory"]})
@@ -154,15 +218,80 @@ def test_connection(data=None):
                 c[f] = str(data[f]).strip()
         if data.get("password"):
             c["password"] = data["password"]
+        if isinstance(data.get("ssh"), dict):
+            d, ssh = data["ssh"], c["ssh"]
+            before = (ssh["host"], str(ssh["port"]))
+            _apply_ssh_fields(ssh, d)
+            for f in SSH_SECRETS:
+                if d.get(f):
+                    ssh[f] = d[f]
+            if (ssh["host"], str(ssh["port"])) != before or d.get("reset_host_key"):
+                ssh["host_key"] = None
     if not c.get("dbname"):
         raise ValueError("Informe o nome do banco")
+    if c["ssh"]["enabled"] and (not c["ssh"]["host"] or not c["ssh"]["user"]):
+        raise ValueError("Informe o servidor e o usuário SSH")
+    info = {}
     try:
-        version = dumpers.adapter_for(c).test()
+        with db_access(c, info=info) as adapter:
+            version = adapter.test()
     except Exception as e:
         mark_connection(False, c["sgbd"], error=str(e))
+        if isinstance(e, tunnel.TunnelError):
+            raise RuntimeError(str(e)) from e
         raise
     mark_connection(True, c["sgbd"], version=version)
-    return version
+    return version, info.get("host_key")
+
+
+@contextmanager
+def db_access(conn, elog=None, info=None):
+    """Entrega um adaptador pronto para uso, abrindo o túnel SSH se configurado."""
+    ssh = conn.get("ssh") or {}
+    port = str(conn.get("port") or dumpers.DEFAULT_PORT[conn["sgbd"]])
+    if not ssh.get("enabled"):
+        a = dumpers.adapter_for(conn)
+        a.where = f"{a.host}:{a.port}"
+        yield a
+        return
+    target = f"{ssh['user']}@{ssh['host']}:{ssh.get('port') or 22}"
+    if elog:
+        elog("INFO", f"Abrindo túnel SSH para {target}")
+    try:
+        t = tunnel.Tunnel(ssh, conn.get("host") or "localhost", port).start()
+    except tunnel.TunnelError as e:
+        mark_connection(False, conn["sgbd"], error=f"SSH: {e}")
+        if elog:
+            raise BackupError(f"Falha no túnel SSH: {e}") from e
+        raise
+    try:
+        seen = t.host_key
+        if seen:
+            _remember_host_key(ssh, seen)
+            if info is not None:
+                info["host_key"] = seen["fingerprint"]
+        fp = (seen or ssh.get("host_key") or {}).get("fingerprint", "")
+        if elog:
+            elog("OK", f"Túnel SSH estabelecido · chave do host {fp}")
+        local = dict(conn, host="127.0.0.1", port=str(t.local_port))
+        a = dumpers.adapter_for(local)
+        a.where = f"{conn.get('host') or 'localhost'}:{port} via SSH {ssh['host']}"
+        yield a
+    finally:
+        t.close()
+
+
+def _remember_host_key(ssh, seen):
+    """TOFU: grava a chave do host na primeira conexão bem-sucedida."""
+    target = (ssh["host"], str(ssh.get("port") or 22))
+    saved = get_connection()
+    sssh = saved["ssh"]
+    if (sssh["host"], str(sssh["port"])) == target and not sssh.get("host_key"):
+        sssh["host_key"] = seen
+        storage.set_setting("connection", saved)
+        log.info("Chave do servidor SSH %s:%s registrada: %s", *target, seen["fingerprint"])
+    elif (sssh["host"], str(sssh["port"])) != target:
+        _seen_host_keys[target] = seen
 
 
 def mark_connection(ok, sgbd, version=None, error=None):
@@ -332,39 +461,40 @@ def _begin_backup(trigger, conn):
 
 def _perform_backup(elog, bid, conn, policy):
     t0 = time.monotonic()
-    adapter = dumpers.adapter_for(conn)
     part = None
     try:
-        elog("INFO", f"Iniciando backup {TRIGGER_LABEL.get(elog.trigger, '')} · {adapter.label}")
-        elog("INFO", f'Conectando ao banco "{adapter.dbname}" em {adapter.host}:{adapter.port}')
-        try:
-            version = adapter.test()
-        except Exception as e:
-            mark_connection(False, adapter.sgbd, error=str(e))
-            raise BackupError(f"Falha na conexão com o banco: {e}") from e
-        mark_connection(True, adapter.sgbd, version=version)
-        elog("OK", f"Conexão estabelecida · {short_version(version)}")
-
+        elog("INFO", f"Iniciando backup {TRIGGER_LABEL.get(elog.trigger, '')} · "
+                     f"{dumpers.SGBD_LABEL[conn['sgbd']]}")
         directory = Path(policy["directory"])
         try:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as e:
             raise BackupError(f"Diretório de backup inacessível ({directory}): {e.strerror}") from e
 
-        stamp = bid[3:]
-        filename = f"{safe_name(adapter.dbname)}_{stamp}.sql"
-        if policy["compression"]:
-            filename += ".gz"
-        if policy["encryption"]:
-            filename += ".enc"
-        final = directory / filename
-        part = directory / (filename + ".part")
+        with db_access(conn, elog) as adapter:
+            elog("INFO", f'Conectando ao banco "{adapter.dbname}" em {adapter.where}')
+            try:
+                version = adapter.test()
+            except Exception as e:
+                mark_connection(False, adapter.sgbd, error=str(e))
+                raise BackupError(f"Falha na conexão com o banco: {e}") from e
+            mark_connection(True, adapter.sgbd, version=version)
+            elog("OK", f"Conexão estabelecida · {short_version(version)}")
 
-        steps = ["dump"] + (["gzip"] if policy["compression"] else []) \
-            + (["AES-256-GCM"] if policy["encryption"] else [])
-        elog("INFO", "Gerando dump em fluxo: " + " → ".join(steps))
+            stamp = bid[3:]
+            filename = f"{safe_name(adapter.dbname)}_{stamp}.sql"
+            if policy["compression"]:
+                filename += ".gz"
+            if policy["encryption"]:
+                filename += ".enc"
+            final = directory / filename
+            part = directory / (filename + ".part")
 
-        stats = _stream_dump(adapter, part, policy)
+            steps = ["dump"] + (["gzip"] if policy["compression"] else []) \
+                + (["AES-256-GCM"] if policy["encryption"] else [])
+            elog("INFO", "Gerando dump em fluxo: " + " → ".join(steps))
+
+            stats = _stream_dump(adapter, part, policy)
 
         os.replace(part, final)
         part = None
@@ -398,6 +528,8 @@ def _perform_backup(elog, bid, conn, policy):
     except Exception as e:
         msg = str(e) if isinstance(e, (BackupError, dumpers.ToolNotFound, crypto.IntegrityError)) \
             else f"{type(e).__name__}: {e}"
+        if isinstance(e, tunnel.TunnelError):
+            msg = f"Falha no túnel SSH: {e}"
         if part is not None:
             try:
                 part.unlink()
@@ -411,7 +543,7 @@ def _perform_backup(elog, bid, conn, policy):
         elog("ERRO", msg)
         elog("ERRO", "Backup abortado — nenhuma cópia foi criada")
         elog.finish("error")
-        if not isinstance(e, (BackupError, dumpers.ToolNotFound)):
+        if not isinstance(e, (BackupError, dumpers.ToolNotFound, tunnel.TunnelError)):
             log.exception("Detalhes do erro")
         return
 
@@ -607,11 +739,13 @@ def start_restore(bid, wait=False):
 
 def _perform_restore(elog, b, conn):
     t0 = time.monotonic()
-    adapter = dumpers.adapter_for(conn)
+    label = dumpers.SGBD_LABEL[conn["sgbd"]]
     try:
         when = datetime.fromisoformat(b["created_at"]).strftime("%d/%m/%Y %H:%M")
+        where = f"{conn['host']}:{conn['port']}" + (
+            f" via SSH {conn['ssh']['host']}" if conn.get("ssh", {}).get("enabled") else "")
         elog("INFO", f"Iniciando restauração da cópia {b['id']} ({when})")
-        elog("INFO", f'Destino: banco "{adapter.dbname}" em {adapter.host}:{adapter.port}')
+        elog("INFO", f'Destino: banco "{conn["dbname"]}" em {where}')
         _check_plaintext(b["path"], b["compressed"], b["encrypted"], b["sha256"])
         elog("OK", "Integridade da cópia verificada antes da restauração")
 
@@ -628,8 +762,8 @@ def _perform_restore(elog, b, conn):
         except Exception as e:
             elog("WARN", f"Não foi possível criar a cópia pré-restauração: {e}")
 
-        elog("INFO", f"Aplicando o dump no {adapter.label}")
-        with adapter.restore_cmd() as (cmd, env):
+        with db_access(conn, elog) as adapter, adapter.restore_cmd() as (cmd, env):
+            elog("INFO", f"Aplicando o dump no {label}")
             proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             err_chunks = []

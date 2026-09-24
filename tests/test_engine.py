@@ -144,7 +144,7 @@ def test_wrong_password(env):
 @needs_maria
 def test_mariadb_backup_restore(env):
     e = _configure(env, MARIA)
-    assert "MariaDB" in e.test_connection()
+    assert "MariaDB" in e.test_connection()[0]
     bid = e.start_backup("manual", wait=True)
     b = e.get_backup(bid)
     assert b["status"] == "success", b["error"]

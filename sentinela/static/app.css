@@ -270,3 +270,4 @@ label.lbl{display:block;font-size:12.5px;font-weight:600;color:var(--ink-3);marg
   .r-date{width:auto;flex:1}
 }
 .btn.disabled{opacity:.6;pointer-events:none}
+textarea.input{resize:vertical;font-size:12px;line-height:1.5;display:block}
