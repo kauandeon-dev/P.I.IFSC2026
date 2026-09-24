@@ -158,14 +158,14 @@ def create_app():
     @login_required
     def test_connection():
         try:
-            version = engine.test_connection(body())
+            version, host_key = engine.test_connection(body())
         except (RuntimeError, dumpers.ToolNotFound) as e:
             return jsonify(ok=False, error=str(e)), 200
         except Exception as e:
             if isinstance(e, ValueError):
                 raise
             return jsonify(ok=False, error=f"{type(e).__name__}: {e}"), 200
-        return jsonify(ok=True, version=engine.short_version(version))
+        return jsonify(ok=True, version=engine.short_version(version), ssh_host_key=host_key)
 
     # ------------------------------------------------------------------- backups
 
@@ -267,8 +267,20 @@ def create_app():
 
 
 def _public_conn(c):
-    out = {k: v for k, v in c.items() if k != "password_sealed" and k != "password"}
+    out = {k: v for k, v in c.items() if k not in ("password_sealed", "password", "ssh")}
     out["has_password"] = bool(c.get("password_sealed"))
+    ssh = c.get("ssh") or {}
+    out["ssh"] = {
+        "enabled": bool(ssh.get("enabled")),
+        "host": ssh.get("host", ""),
+        "port": ssh.get("port", "22"),
+        "user": ssh.get("user", ""),
+        "auth": ssh.get("auth", "password"),
+        "has_password": bool(ssh.get("password_sealed")),
+        "has_private_key": bool(ssh.get("private_key_sealed")),
+        "has_passphrase": bool(ssh.get("key_passphrase_sealed")),
+        "host_key": (ssh.get("host_key") or {}).get("fingerprint"),
+    }
     out["sgbd_label"] = dumpers.SGBD_LABEL.get(c.get("sgbd"), c.get("sgbd"))
     return out
 
