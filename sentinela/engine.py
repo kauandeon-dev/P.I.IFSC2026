@@ -76,6 +76,57 @@ class Busy(Exception):
     pass
 
 
+# Execução em andamento (exibida ao vivo no painel). Só uma por vez (_lock).
+_current = {}
+
+
+def _progress_interval(elapsed):
+    """Intervalo (s) entre linhas de progresso: frequente no início, espaçado depois."""
+    if elapsed < 30:
+        return 2
+    if elapsed < 600:
+        return 10
+    return 60
+
+
+def _set_current(**kw):
+    if kw.get("reset"):
+        _current.clear()
+        kw.pop("reset")
+    _current.update(kw)
+
+
+def _backup_stage(**kw):
+    # Durante a cópia pré-restauração, o painel continua mostrando a restauração.
+    if _current.get("kind") == "backup":
+        _set_current(**kw)
+
+
+def current():
+    return dict(_current) if _lock.locked() and _current else None
+
+
+class Progress:
+    """Registra no log, periodicamente, quantos bytes já foram processados."""
+
+    def __init__(self, elog, label, total=None):
+        self.elog, self.label, self.total = elog, label, total
+        self.bytes = 0
+        self.t0 = self.last = time.monotonic()
+
+    def add(self, n):
+        self.bytes += n
+        _current["bytes"] = self.bytes
+        t = time.monotonic()
+        if self.elog and t - self.last >= _progress_interval(t - self.t0):
+            self.last = t
+            rate = self.bytes / max(t - self.t0, 0.001)
+            msg = f"{self.label}: {fmt_size(self.bytes)}"
+            if self.total:
+                msg += f" de {fmt_size(self.total)} ({min(99, int(self.bytes * 100 / self.total))}%)"
+            self.elog("INFO", f"{msg} · {fmt_size(rate)}/s")
+
+
 class BackupError(Exception):
     pass
 
@@ -87,6 +138,7 @@ def setup_logging():
     if any(isinstance(h, RotatingFileHandler) for h in log.handlers):
         return
     log.setLevel(logging.INFO)
+    log.propagate = False  # evita linhas duplicadas quando o servidor configura o logger raiz
     fh = RotatingFileHandler(settings.MAIN_LOG, maxBytes=5 * 1024 * 1024,
                              backupCount=5, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%Y-%m-%d %H:%M:%S"))
@@ -466,6 +518,10 @@ def _begin_backup(trigger, conn):
         (bid, elog.id, trigger, conn["sgbd"], conn["dbname"], iso(ts),
          int(policy["compression"]), int(policy["encryption"])),
     )
+    if trigger != "pre-restore":
+        _set_current(reset=True, kind="backup", trigger=trigger, backup_id=bid,
+                     execution_id=elog.id, started_at=iso(ts), stage="inicio", bytes=0, total=None,
+                     ssh=bool((conn.get("ssh") or {}).get("enabled")))
     return elog, bid, conn, policy
 
 
@@ -481,6 +537,7 @@ def _perform_backup(elog, bid, conn, policy):
         except OSError as e:
             raise BackupError(f"Diretório de backup inacessível ({directory}): {e.strerror}") from e
 
+        _backup_stage(stage="conexao")
         with db_access(conn, elog) as adapter:
             elog("INFO", f'Conectando ao banco "{adapter.dbname}" em {adapter.where}')
             try:
@@ -503,8 +560,8 @@ def _perform_backup(elog, bid, conn, policy):
             steps = ["dump"] + (["gzip"] if policy["compression"] else []) \
                 + (["AES-256-GCM"] if policy["encryption"] else [])
             elog("INFO", "Gerando dump em fluxo: " + " → ".join(steps))
-
-            stats = _stream_dump(adapter, part, policy)
+            _backup_stage(stage="dump", bytes=0)
+            stats = _stream_dump(adapter, part, policy, elog)
 
         os.replace(part, final)
         part = None
@@ -523,7 +580,9 @@ def _perform_backup(elog, bid, conn, policy):
         elog("INFO", f"SHA-256 {stats['sha256']}")
 
         # Verificação de integridade logo após a gravação
-        _check_plaintext(final, policy["compression"], policy["encryption"], stats["sha256"])
+        _backup_stage(stage="verificacao", bytes=0, total=stats["raw"])
+        _check_plaintext(final, policy["compression"], policy["encryption"], stats["sha256"],
+                         Progress(None, "") if _current.get("kind") == "backup" else None)
         elog("OK", "Integridade verificada: arquivo legível e dump completo")
 
         dur = time.monotonic() - t0
@@ -563,8 +622,9 @@ def _perform_backup(elog, bid, conn, policy):
         elog("WARN", f"Falha ao aplicar retenção: {e}")
 
 
-def _stream_dump(adapter, part, policy):
+def _stream_dump(adapter, part, policy, elog=None):
     """Executa o dump e grava comprimido/criptografado em ``part``."""
+    progress = Progress(elog, "Dump em andamento")
     comp = zlib.compressobj(6, zlib.DEFLATED, 31) if policy["compression"] else None
     enc = crypto.StreamEncryptor(key()) if policy["encryption"] else None
     sha = hashlib.sha256()
@@ -600,6 +660,7 @@ def _stream_dump(adapter, part, policy):
                 if not chunk:
                     break
                 stats["raw"] += len(chunk)
+                progress.add(len(chunk))
                 tail = (tail + chunk)[-512:]
                 emit(comp.compress(chunk) if comp else chunk)
             if comp:
@@ -669,7 +730,7 @@ def iter_plaintext(path, compressed, encrypted, sink):
             raise crypto.IntegrityError("Arquivo gzip truncado")
 
 
-def _check_plaintext(path, compressed, encrypted, expected_sha=None):
+def _check_plaintext(path, compressed, encrypted, expected_sha=None, progress=None):
     """Valida hash, autenticação, gzip e marcador de fim do dump. Retorna bytes de SQL."""
     if not os.path.exists(path):
         raise crypto.IntegrityError("Arquivo da cópia não encontrado no diretório")
@@ -680,6 +741,8 @@ def _check_plaintext(path, compressed, encrypted, expected_sha=None):
     def sink(b):
         state["n"] += len(b)
         state["tail"] = (state["tail"] + b)[-512:]
+        if progress:
+            progress.add(len(b))
     try:
         iter_plaintext(path, compressed, encrypted, sink)
     except zlib.error as e:
@@ -700,9 +763,12 @@ def verify_backup(bid):
     _acquire()
     try:
         elog = ExecLog("verify", "manual", bid, b["sgbd"], b["dbname"])
+        _set_current(reset=True, kind="verify", trigger="manual", backup_id=bid, execution_id=elog.id,
+                     started_at=iso(elog.started), stage="verificacao", bytes=0, total=b["raw_size"])
         elog("INFO", f"Verificando integridade da cópia {bid}")
         try:
-            n = _check_plaintext(b["path"], b["compressed"], b["encrypted"], b["sha256"])
+            n = _check_plaintext(b["path"], b["compressed"], b["encrypted"], b["sha256"],
+                                 Progress(elog, "Verificando", b["raw_size"]))
             elog("OK", "SHA-256 confere com o registrado")
             if b["encrypted"]:
                 elog("OK", "Autenticação AES-256-GCM válida")
@@ -735,6 +801,9 @@ def start_restore(bid, wait=False):
     _acquire()
     try:
         elog = ExecLog("restore", "manual", bid, conn["sgbd"], conn["dbname"])
+        _set_current(reset=True, kind="restore", trigger="manual", backup_id=bid,
+                     execution_id=elog.id, started_at=iso(elog.started), stage="verificacao",
+                     bytes=0, total=b["raw_size"], ssh=bool((conn.get("ssh") or {}).get("enabled")))
     except Exception:
         _lock.release()
         raise
@@ -757,10 +826,11 @@ def _perform_restore(elog, b, conn):
             f" via SSH {conn['ssh']['host']}" if conn.get("ssh", {}).get("enabled") else "")
         elog("INFO", f"Iniciando restauração da cópia {b['id']} ({when})")
         elog("INFO", f'Destino: banco "{conn["dbname"]}" em {where}')
-        _check_plaintext(b["path"], b["compressed"], b["encrypted"], b["sha256"])
+        _check_plaintext(b["path"], b["compressed"], b["encrypted"], b["sha256"], Progress(None, ""))
         elog("OK", "Integridade da cópia verificada antes da restauração")
 
         # Cópia de segurança do estado atual, para permitir desfazer.
+        _set_current(stage="pre-backup", bytes=0, total=None)
         elog("INFO", "Gerando cópia de segurança do estado atual do banco")
         pre_id = None
         try:
@@ -775,8 +845,11 @@ def _perform_restore(elog, b, conn):
         except Exception as e:
             elog("WARN", f"Não foi possível criar a cópia pré-restauração: {e}")
 
+        _set_current(stage="conexao", bytes=0, total=b["raw_size"])
         with db_access(conn, elog) as adapter, adapter.restore_cmd() as (cmd, env):
             elog("INFO", f"Aplicando o dump no {label}")
+            _set_current(stage="aplicando")
+            progress = Progress(elog, "Restaurando", b["raw_size"])
             proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             err_chunks = []
@@ -790,6 +863,7 @@ def _perform_restore(elog, b, conn):
                     return
                 try:
                     proc.stdin.write(data)
+                    progress.add(len(data))
                 except BrokenPipeError:
                     broken = True
 

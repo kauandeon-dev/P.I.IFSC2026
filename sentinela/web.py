@@ -3,7 +3,7 @@
 import os
 import shutil
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 
@@ -120,6 +120,9 @@ def create_app():
         except OSError:
             pass
         nxt = engine.next_run_at()
+        history = storage.rows(
+            "SELECT id, created_at, trigger, status, size, raw_size, duration FROM backups "
+            "WHERE status != 'running' ORDER BY created_at DESC LIMIT 14")[::-1]
         return jsonify(
             user=session["user"],
             version=__version__,
@@ -136,6 +139,9 @@ def create_app():
                      "bytes": sum(b["size"] or 0 for b in ok), "disk": disk,
                      "directory": policy["directory"]},
             key_path=str(settings.KEY_PATH),
+            current=_current_view(),
+            chart=history,
+            health=_health(policy, conn, ok, disk, interval),
             limits={"retention": [settings.RETENTION_MIN, settings.RETENTION_MAX],
                     "interval": [settings.INTERVAL_MIN, settings.INTERVAL_MAX]},
         )
@@ -196,7 +202,7 @@ def create_app():
         b = engine.get_backup(bid)
         if not b:
             return jsonify(error="Cópia não encontrada"), 404
-        lines = storage.rows("SELECT ts, level, message FROM log_lines WHERE execution_id=? "
+        lines = storage.rows("SELECT id, ts, level, message FROM log_lines WHERE execution_id=? "
                              "ORDER BY id", (b["execution_id"],))
         related = storage.rows(
             "SELECT id, kind, started_at, status FROM executions WHERE backup_id=? AND kind!='backup' "
@@ -240,8 +246,8 @@ def create_app():
         e = storage.row("SELECT * FROM executions WHERE id=?", (eid,))
         if not e:
             return jsonify(error="Execução não encontrada"), 404
-        e["lines"] = storage.rows("SELECT ts, level, message FROM log_lines WHERE execution_id=? "
-                                  "ORDER BY id", (eid,))
+        e["lines"] = storage.rows("SELECT id, ts, level, message FROM log_lines "
+                                  "WHERE execution_id=? ORDER BY id", (eid,))
         return jsonify(execution=e)
 
     @app.get("/api/logs")
@@ -251,9 +257,27 @@ def create_app():
         execs = storage.rows("SELECT * FROM executions ORDER BY id DESC LIMIT ?", (limit,))
         for e in execs:
             e["lines"] = storage.rows(
-                "SELECT ts, level, message FROM log_lines WHERE execution_id=? ORDER BY id",
+                "SELECT id, ts, level, message FROM log_lines WHERE execution_id=? ORDER BY id",
                 (e["id"],))
-        return jsonify(executions=execs)
+        last = storage.row("SELECT MAX(id) AS m FROM log_lines")["m"] or 0
+        return jsonify(executions=execs, last_id=last, running=engine.is_busy())
+
+    @app.get("/api/logs/tail")
+    @login_required
+    def logs_tail():
+        """Linhas novas desde ``since`` (para o terminal ao vivo, estilo tail -f)."""
+        since = int(request.args.get("since", 0))
+        lines = storage.rows(
+            "SELECT id, execution_id, ts, level, message FROM log_lines WHERE id > ? "
+            "ORDER BY id LIMIT 2000", (since,))
+        ids = sorted({ln["execution_id"] for ln in lines})
+        execs = storage.rows(
+            f"SELECT * FROM executions WHERE id IN ({','.join('?' * len(ids))}) "
+            "OR status = 'running'", ids) if ids else \
+            storage.rows("SELECT * FROM executions WHERE status = 'running'")
+        last = lines[-1]["id"] if lines else since
+        return jsonify(lines=lines, executions=execs, last_id=last, running=engine.is_busy(),
+                       current=_current_view())
 
     @app.get("/api/logs/download")
     @login_required
@@ -264,6 +288,59 @@ def create_app():
                          mimetype="text/plain")
 
     return app
+
+
+def _current_view():
+    cur = engine.current()
+    if not cur:
+        return None
+    started = cur.get("started_at")
+    if started:
+        cur["elapsed"] = (storage.now() - datetime.fromisoformat(started)).total_seconds()
+    return cur
+
+
+def _health(policy, conn, ok, disk, interval):
+    """Checklist de saúde da proteção exibido no painel."""
+    items = []
+
+    def add(state, title, detail):
+        items.append({"state": state, "title": title, "detail": detail})
+
+    last_ok = ok[0] if ok else None
+    if not engine.connection_ready(conn):
+        add("warn", "Conexão não configurada", "Configure o banco para ativar os backups automáticos.")
+    elif not last_ok:
+        add("warn", "Nenhuma cópia válida ainda", "Faça o primeiro backup para começar a proteção.")
+    else:
+        age = (storage.now() - datetime.fromisoformat(last_ok["created_at"])).total_seconds() / 86400
+        if age <= interval + 1:
+            add("ok", "Cópia recente disponível", f"Último backup válido: {last_ok['id']}.")
+        else:
+            add("err", "Backups atrasados",
+                f"A última cópia válida tem {int(age)} dias; o agendamento é a cada {interval} dia(s).")
+        if last_ok.get("verify_ok"):
+            add("ok", "Integridade verificada", "A cópia mais recente foi lida e conferida por completo.")
+        else:
+            add("warn", "Integridade não confirmada", "Use \"Verificar integridade\" na cópia mais recente.")
+    add("ok" if policy["encryption"] else "err", "Criptografia AES-256",
+        "Cópias ilegíveis sem a chave mestra." if policy["encryption"]
+        else "Desativada: qualquer pessoa com acesso à pasta lê os dados.")
+    add("ok" if policy["compression"] else "warn", "Compressão gzip",
+        "Economiza espaço em disco." if policy["compression"] else "Desativada: as cópias ocupam mais espaço.")
+    ssh = conn.get("ssh") or {}
+    if ssh.get("enabled"):
+        add("ok" if ssh.get("host_key") else "warn", "Túnel SSH",
+            "Chave do servidor registrada e verificada a cada conexão." if ssh.get("host_key")
+            else "A chave do servidor será registrada na primeira conexão.")
+    if disk:
+        avg = (sum(b["size"] or 0 for b in ok) / len(ok)) if ok else 0
+        free_ok = not avg or disk["free"] > avg * 5
+        add("ok" if free_ok else "warn", "Espaço em disco",
+            "Espaço livre suficiente para as próximas cópias." if free_ok
+            else "Pouco espaço livre no diretório de backup.")
+    add("info", "Chave mestra", "Guarde uma cópia da chave fora do servidor (regra 3-2-1).")
+    return items
 
 
 def _public_conn(c):
