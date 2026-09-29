@@ -642,3 +642,71 @@ def test_silent_network_loss_mid_dump_does_not_hang(env, monkeypatch):
     assert not list(env["backups"].glob("*.sql*"))
     time.sleep(2)
     backup_ok(e)  # rede de volta: tudo normal
+
+
+# ============================================ completude do dump (MariaDB)
+
+def _ro_user(with_proc):
+    sqls = ["DROP USER IF EXISTS 'ro'@'localhost'",
+            "CREATE USER 'ro'@'localhost' IDENTIFIED BY 'Ro#2026'",
+            "GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, EVENT ON loja_remota.* TO 'ro'@'localhost'"]
+    if with_proc:
+        sqls.append("GRANT SELECT ON mysql.proc TO 'ro'@'localhost'")
+    for q in sqls:
+        subprocess.run(["mariadb", f"--socket={MARIA_SOCK}", "-uroot", "-e", q], check=True)
+
+
+def test_routines_verified_when_privilege_present(env):
+    _ro_user(with_proc=True)
+    e = setup(env, {**RMARIA, "user": "ro", "password": "Ro#2026"}, ssh_pw())
+    b = backup_ok(e)
+    msgs = lines(env, b["execution_id"])
+    assert any("Conferência: 1 procedure(s)/function(s)" in m for m in msgs)
+    assert not any(m.startswith("Não foi possível conferir") for m in msgs)
+
+
+def test_invisible_routines_are_reported_not_silent(env):
+    """Sem permissão, o mariadb-dump pula rotinas SEM ERRO; o Sentinela avisa."""
+    _ro_user(with_proc=False)
+    e = setup(env, {**RMARIA, "user": "ro", "password": "Ro#2026"}, ssh_pw())
+    b = backup_ok(e)
+    msgs = lines(env, b["execution_id"])
+    assert any("Não foi possível conferir procedures/functions" in m for m in msgs)
+    import importlib
+    import sentinela.web as web
+    importlib.reload(web)
+    health = web._health(e.get_policy(), e.get_connection(), [b], None, 1)
+    assert any(h["title"] == "Permissões do usuário de backup" and h["state"] == "warn" for h in health)
+
+
+def test_missing_routines_fail_the_backup(env, monkeypatch):
+    from sentinela import dumpers
+    e = setup(env, RMARIA, ssh_pw())
+    monkeypatch.setattr(dumpers.MariaDBAdapter, "preflight", lambda self: ([], {"routines": 5}))
+    b = e.get_backup(e.start_backup("manual", wait=True))
+    assert b["status"] == "error"
+    assert "Dump incompleto" in b["error"] and "5 procedure" in b["error"]
+    assert not list(env["backups"].glob("*"))
+
+
+def test_cli_backup_blocked_while_panel_backup_runs(env):
+    """Trava entre processos: `sentinela backup` (cron) não roda junto com o painel."""
+    e = setup(env, RPG, ssh_pw(), compression=False)
+    result = {}
+    t = threading.Thread(target=lambda: result.setdefault("id", e.start_backup("manual", wait=True)))
+    t.start()
+    deadline = time.time() + 30
+    while time.time() < deadline and not list(env["backups"].glob("*.part")):
+        time.sleep(0.05)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p = subprocess.run(["python3", "-m", "sentinela", "backup"], cwd=root, capture_output=True,
+                       text=True, env={**os.environ})
+    t.join(120)
+    assert p.returncode != 0
+    assert "Outro processo do Sentinela" in p.stderr
+    assert e.get_backup(result["id"])["status"] == "success"
+    # terminado o backup do painel, a linha de comando funciona
+    p = subprocess.run(["python3", "-m", "sentinela", "backup"], cwd=root, capture_output=True,
+                       text=True, env={**os.environ})
+    assert p.returncode == 0, p.stderr
+    assert ": success" in p.stdout

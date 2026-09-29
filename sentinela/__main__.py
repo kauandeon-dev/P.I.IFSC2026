@@ -63,7 +63,10 @@ def cmd_passwd(args):
 def cmd_backup(args):
     engine.setup_logging()
     storage.init()
-    bid = engine.start_backup("manual", wait=True)
+    try:
+        bid = engine.start_backup("manual", wait=True)
+    except (engine.Busy, ValueError) as e:
+        sys.exit(f"Backup não iniciado: {e}")
     b = engine.get_backup(bid)
     print(f"{bid}: {b['status']}" + (f" — {b['error']}" if b["error"] else f" — {b['path']}"))
     sys.exit(0 if b["status"] == "success" else 1)

@@ -7,6 +7,7 @@ Pipeline de backup (em fluxo, sem arquivos intermediários em texto claro):
 Cada execução gera um log detalhado (banco SQLite + arquivo em disco).
 """
 
+import fcntl
 import hashlib
 import logging
 import os
@@ -453,9 +454,40 @@ class ExecLog:
 
 # ================================================================ concorrência
 
+_lock_fd = None
+
+
 def _acquire():
+    """Uma execução por vez — no processo (thread lock) e entre processos (flock),
+    para que um `sentinela backup` agendado no cron não rode junto com o painel."""
+    global _lock_fd
     if not _lock.acquire(blocking=False):
         raise Busy("Já existe uma execução em andamento. Aguarde a conclusão.")
+    try:
+        settings.ensure_dirs()
+        fd = os.open(settings.HOME / "sentinela.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return  # sem arquivo de trava: segue só com a trava do processo
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        _release()
+        raise Busy("Outro processo do Sentinela está executando um backup ou restauração. "
+                   "Aguarde a conclusão.")
+    _lock_fd = fd
+
+
+def _release():
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        except OSError:
+            pass
+        _lock_fd = None
+    _lock.release()
 
 
 def is_busy():
@@ -469,7 +501,7 @@ def _spawn(fn, *args):
         except Exception:
             log.exception("Erro inesperado na execução em segundo plano")
         finally:
-            _lock.release()
+            _release()
     threading.Thread(target=runner, daemon=True, name="sentinela-exec").start()
 
 
@@ -486,13 +518,13 @@ def start_backup(trigger="manual", wait=False):
     try:
         ctx = _begin_backup(trigger, conn)
     except Exception:
-        _lock.release()
+        _release()
         raise
     if wait:
         try:
             _perform_backup(*ctx)
         finally:
-            _lock.release()
+            _release()
     else:
         _spawn(_perform_backup, *ctx)
     return ctx[1]
@@ -548,6 +580,11 @@ def _perform_backup(elog, bid, conn, policy):
             mark_connection(True, adapter.sgbd, version=version)
             elog("OK", f"Conexão estabelecida · {short_version(version)}")
 
+            warnings, expected = adapter.preflight()
+            for w in warnings:
+                elog("WARN", w)
+            storage.set_setting("last_preflight", {"at": iso(now()), "warnings": warnings})
+
             stamp = bid[3:]
             filename = f"{safe_name(adapter.dbname)}_{stamp}.sql"
             if policy["compression"]:
@@ -562,6 +599,7 @@ def _perform_backup(elog, bid, conn, policy):
             elog("INFO", "Gerando dump em fluxo: " + " → ".join(steps))
             _backup_stage(stage="dump", bytes=0)
             stats = _stream_dump(adapter, part, policy, elog)
+            _check_completeness(elog, stats, expected)
 
         os.replace(part, final)
         part = None
@@ -622,9 +660,40 @@ def _perform_backup(elog, bid, conn, policy):
         elog("WARN", f"Falha ao aplicar retenção: {e}")
 
 
+class _RoutineCounter:
+    """Conta, em fluxo, as procedures/functions presentes no dump do MariaDB."""
+
+    RX = re.compile(rb"\nCREATE DEFINER=`[^\n]{0,400}? (?:PROCEDURE|FUNCTION) `")
+
+    def __init__(self):
+        self.carry = b""
+        self.count = 0
+
+    def feed(self, chunk):
+        data = self.carry + chunk
+        for m in self.RX.finditer(data):
+            if m.end() > len(self.carry):  # não conta de novo o que já estava no bloco anterior
+                self.count += 1
+        self.carry = data[-512:]
+
+
+def _check_completeness(elog, stats, expected):
+    if "routines" not in expected:
+        return
+    found, want = stats.get("routines", 0), expected["routines"]
+    if found < want:
+        raise BackupError(
+            f"Dump incompleto: o banco tem {want} procedure(s)/function(s), mas só {found} "
+            "entraram na cópia — o usuário de backup não consegue ler todas as rotinas. "
+            "Conceda: GRANT SELECT ON mysql.proc TO 'usuario'@'host'")
+    if want:
+        elog("OK", f"Conferência: {found} procedure(s)/function(s) incluída(s) na cópia")
+
+
 def _stream_dump(adapter, part, policy, elog=None):
     """Executa o dump e grava comprimido/criptografado em ``part``."""
     progress = Progress(elog, "Dump em andamento")
+    routines = _RoutineCounter() if adapter.sgbd == "mariadb" else None
     comp = zlib.compressobj(6, zlib.DEFLATED, 31) if policy["compression"] else None
     enc = crypto.StreamEncryptor(key()) if policy["encryption"] else None
     sha = hashlib.sha256()
@@ -661,6 +730,8 @@ def _stream_dump(adapter, part, policy, elog=None):
                     break
                 stats["raw"] += len(chunk)
                 progress.add(len(chunk))
+                if routines:
+                    routines.feed(chunk)
                 tail = (tail + chunk)[-512:]
                 emit(comp.compress(chunk) if comp else chunk)
             if comp:
@@ -689,6 +760,8 @@ def _stream_dump(adapter, part, policy, elog=None):
     if not comp:
         stats["compressed"] = stats["raw"]
     stats["sha256"] = sha.hexdigest()
+    if routines:
+        stats["routines"] = routines.count
     return stats
 
 
@@ -784,7 +857,7 @@ def verify_backup(bid):
             elog.finish("error")
             return False, str(e)
     finally:
-        _lock.release()
+        _release()
 
 
 # ================================================================ restauração
@@ -805,13 +878,13 @@ def start_restore(bid, wait=False):
                      execution_id=elog.id, started_at=iso(elog.started), stage="verificacao",
                      bytes=0, total=b["raw_size"], ssh=bool((conn.get("ssh") or {}).get("enabled")))
     except Exception:
-        _lock.release()
+        _release()
         raise
     if wait:
         try:
             _perform_restore(elog, b, conn)
         finally:
-            _lock.release()
+            _release()
     else:
         _spawn(_perform_restore, elog, b, conn)
     return elog.id

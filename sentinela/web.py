@@ -23,6 +23,10 @@ def create_app():
     storage.init()
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
     app.secret_key = crypto.derive(engine.key(), "sentinela/flask-session")
+    if os.environ.get("SENTINELA_HTTPS") == "1":
+        # Atrás de um proxy HTTPS: usa o IP real do cliente (bloqueio de login por IP).
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
@@ -323,6 +327,9 @@ def _health(policy, conn, ok, disk, interval):
             add("ok", "Integridade verificada", "A cópia mais recente foi lida e conferida por completo.")
         else:
             add("warn", "Integridade não confirmada", "Use \"Verificar integridade\" na cópia mais recente.")
+    pre = storage.get_setting("last_preflight") or {}
+    if pre.get("warnings"):
+        add("warn", "Permissões do usuário de backup", pre["warnings"][0])
     add("ok" if policy["encryption"] else "err", "Criptografia AES-256",
         "Cópias ilegíveis sem a chave mestra." if policy["encryption"]
         else "Desativada: qualquer pessoa com acesso à pasta lê os dados.")

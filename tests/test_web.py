@@ -124,3 +124,17 @@ def test_progress_interval():
     assert engine._progress_interval(0) == 2
     assert engine._progress_interval(45) == 10
     assert engine._progress_interval(3600) == 60
+
+
+def test_login_lockout_uses_real_ip_behind_proxy(env, monkeypatch):
+    monkeypatch.setenv("SENTINELA_HTTPS", "1")
+    c = _client(env)
+    for _ in range(5):
+        c.post("/api/login", json={"username": "admin", "password": "x"},
+               headers={"X-Forwarded-For": "203.0.113.9"})
+    blocked = c.post("/api/login", json={"username": "admin", "password": "senha-forte-123"},
+                     headers={"X-Forwarded-For": "203.0.113.9"})
+    assert blocked.status_code == 429
+    other = c.post("/api/login", json={"username": "admin", "password": "senha-forte-123"},
+                   headers={"X-Forwarded-For": "198.51.100.7"})
+    assert other.status_code == 200  # o administrador em outro IP não é bloqueado

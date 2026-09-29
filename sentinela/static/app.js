@@ -184,6 +184,7 @@
     S.route = route; S.param = param;
     document.title = `${TITLES[route]} · Sentinela`;
     S.enter = changed;
+    if (changed) window.scrollTo(0, 0);
     render();
     await load();
     render();
@@ -252,8 +253,13 @@
     const term = document.getElementById('term-body');
     const termScroll = term ? term.scrollTop : null;
     app.innerHTML = viewShell(body);
-    if (S.enter && S.data) { document.querySelector('.content').classList.add('fade'); S.enter = false; }
-    const m2 = document.querySelector('.main'); if (m2) m2.scrollTop = scroll;
+    const m2 = document.querySelector('.main');
+    if (S.enter && S.data) {
+      // página nova: começa do topo, com animação de entrada
+      document.querySelector('.content').classList.add('fade'); S.enter = false;
+    } else if (m2) {
+      m2.scrollTop = scroll;  // mesma página atualizada: mantém a posição
+    }
     const t2 = document.getElementById('term-body'); if (t2 && termScroll != null) t2.scrollTop = termScroll;
     document.querySelectorAll('[data-w]').forEach((el) => { el.style.width = el.dataset.w + '%'; });
     if (S.route === 'logs') bindTerm();
@@ -374,7 +380,7 @@
     const st = d.storage;
     const pct = Math.min(100, Math.round((st.copies / st.expected) * 100));
     const sched = p.schedule_mode === 'daily' ? 'Diário · 00:00' : `A cada ${p.interval_days} dias`;
-    const copies = `${st.copies} de ${st.expected} ${st.expected === 1 ? 'cópia' : 'cópias'}`;
+    const copies = `${st.copies} ${st.copies === 1 ? 'cópia guardada' : 'cópias guardadas'}`;
 
     let alert = '';
     if (!d.active) {
@@ -485,6 +491,8 @@
     const W = 640, H = 150, PL = 52, PB = 20, PT = 8;
     const max = Math.max(...items.map((b) => b.size || 0), 1);
     const slots = Math.max(items.length, 8);
+    const days = new Set(items.map((b) => b.created_at.slice(0, 10)));
+    const sameDay = days.size === 1;
     const slot = (W - PL) / slots;
     const bw = Math.min(30, slot * 0.62);
     const ih = H - PB - PT;
@@ -500,7 +508,8 @@
       const cls = err ? 'bar-err' : b.trigger === 'auto' ? 'bar-ok' : 'bar-man';
       const tip = `${fmtWhen(b.created_at)} · ${TYPE[b.trigger] || b.trigger} · ${err ? 'Falhou' : fmtSize(b.size) + ' · ' + fmtDur(b.duration)}`;
       const d = parse(b.created_at);
-      const lab = items.length <= 10 || i % 2 === 0 ? `<text x="${x + bw / 2}" y="${H - 5}" text-anchor="middle">${pad(d.getDate())}/${pad(d.getMonth() + 1)}</text>` : '';
+      const txt = sameDay ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`;
+      const lab = items.length <= 10 || i % 2 === 0 ? `<text x="${x + bw / 2}" y="${H - 5}" text-anchor="middle">${txt}</text>` : '';
       g += `<g class="b" data-open="${esc(b.id)}"><title>${esc(tip)}</title><rect class="${cls}" x="${x}" y="${PT + ih - h}" width="${bw}" height="${h}" rx="3"/>${lab}</g>`;
     });
     return `<div class="chart-wrap"><svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Tamanho das últimas cópias">${g}</svg></div>

@@ -58,16 +58,28 @@ class Adapter:
     def query_cmd(self, sql):
         raise NotImplementedError
 
-    def test(self):
-        """Executa uma consulta simples e devolve a versão do servidor."""
-        with self.query_cmd("SELECT version()") as (cmd, env):
+    def query(self, sql):
+        """Executa uma consulta e devolve a saída em texto (erro => RuntimeError)."""
+        with self.query_cmd(sql) as (cmd, env):
             p = subprocess.run(
                 cmd, env=env, capture_output=True, text=True,
                 timeout=settings.CONNECT_TIMEOUT + 5,
             )
         if p.returncode != 0:
             raise RuntimeError(clean_stderr(p.stderr) or f"código de saída {p.returncode}")
-        return p.stdout.strip().splitlines()[0] if p.stdout.strip() else ""
+        return p.stdout.strip()
+
+    def test(self):
+        """Executa uma consulta simples e devolve a versão do servidor."""
+        out = self.query("SELECT version()")
+        return out.splitlines()[0] if out else ""
+
+    def preflight(self):
+        """Confere, antes do dump, se o usuário enxerga tudo o que será copiado.
+
+        Retorna (avisos, esperado) — ``esperado`` traz contagens que serão
+        conferidas no dump pronto."""
+        return [], {}
 
 
 class PostgresAdapter(Adapter):
@@ -115,9 +127,10 @@ class MariaDBAdapter(Adapter):
         fd, path = tempfile.mkstemp(prefix="sentinela-", suffix=".cnf")
         try:
             with os.fdopen(fd, "w") as f:
-                pw = self.password.replace("\\", "\\\\").replace('"', '\\"')
-                f.write(f'[client]\nuser="{self.user}"\npassword="{pw}"\n'
-                        f'host="{self.host}"\nport={self.port}\n')
+                def q(v):
+                    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+                f.write(f"[client]\nuser={q(self.user)}\npassword={q(self.password)}\n"
+                        f"host={q(self.host)}\nport={int(self.port)}\n")
             yield path
         finally:
             try:
@@ -149,6 +162,24 @@ class MariaDBAdapter(Adapter):
                    f"--defaults-extra-file={cnf}", "--protocol=TCP",
                    f"--connect-timeout={settings.CONNECT_TIMEOUT}", "-N", "-B", "-D", self.dbname, "-e", sql]
             yield cmd, os.environ.copy()
+
+    def preflight(self):
+        """O mariadb-dump OMITE EM SILÊNCIO procedures/functions que o usuário não
+        consegue enxergar (sem erro, código 0). Aqui contamos as rotinas direto em
+        mysql.proc para conferir o dump depois; sem permissão, avisamos."""
+        warnings, expected = [], {}
+        try:
+            expected["routines"] = int(self.query(
+                "SELECT COUNT(*) FROM mysql.proc WHERE db = DATABASE()") or 0)
+        except (RuntimeError, ValueError) as e:
+            if "doesn't exist" in str(e):
+                # MySQL 8 não tem mysql.proc: não há como contar por fora; sem alarme falso.
+                return warnings, expected
+            warnings.append(
+                "Não foi possível conferir procedures/functions: sem permissão de leitura em "
+                "mysql.proc. Rotinas criadas por outros usuários podem ficar fora da cópia. "
+                "Conceda: GRANT SELECT ON mysql.proc TO 'usuario'@'host'")
+        return warnings, expected
 
 
 def adapter_for(conn):

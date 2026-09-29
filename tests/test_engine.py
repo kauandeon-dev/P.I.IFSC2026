@@ -192,3 +192,20 @@ def test_decrypt_cli(env, tmp_path):
                    check=True, cwd=os.path.dirname(os.path.dirname(__file__)),
                    env={**os.environ})
     assert b"PostgreSQL database dump complete" in out.read_bytes()
+
+
+def test_mariadb_preflight_without_mysql_proc_table(env, monkeypatch):
+    """Servidor MySQL 8 (sem mysql.proc): nada de alarme falso de permissão."""
+    from sentinela import dumpers
+    a = dumpers.MariaDBAdapter(MARIA)
+
+    def fake_query(sql):
+        raise RuntimeError("ERROR 1146 (42S02): Table 'mysql.proc' doesn't exist")
+    monkeypatch.setattr(a, "query", fake_query)
+    assert a.preflight() == ([], {})
+
+    def denied(sql):
+        raise RuntimeError("ERROR 1142 (42000): SELECT command denied to user")
+    monkeypatch.setattr(a, "query", denied)
+    warns, expected = a.preflight()
+    assert expected == {} and "mysql.proc" in warns[0]
