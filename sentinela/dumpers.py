@@ -160,6 +160,29 @@ def adapter_for(conn):
     raise ValueError(f"SGBD não suportado: {sgbd}")
 
 
+# Dicas para erros de permissão comuns (anexadas à mensagem de erro).
+PRIVILEGE_HINTS = (
+    ("insufficient privileges to SHOW CREATE",
+     "o usuário de backup precisa ler o código de procedures/functions criadas por outro usuário: "
+     "GRANT SELECT ON mysql.proc TO 'usuario'@'host' (MariaDB até 11.2) ou "
+     "GRANT SHOW CREATE ROUTINE ON banco.* TO 'usuario'@'host' (MariaDB 11.3+)"),
+    ("Access denied; you need (at least one of) the PROCESS privilege",
+     "conceda: GRANT PROCESS ON *.* TO 'usuario'@'host' (ou atualize o cliente mariadb-dump)"),
+    ("permission denied for",
+     "o usuário do PostgreSQL não tem leitura em todos os objetos: "
+     "GRANT pg_read_all_data TO usuario (PostgreSQL 14+) ou use o dono do banco"),
+    ("must be owner of",
+     "para restaurar no PostgreSQL, use o dono do banco (ou um usuário com os mesmos privilégios)"),
+)
+
+
+def hint_for(message):
+    for needle, hint in PRIVILEGE_HINTS:
+        if needle.lower() in (message or "").lower():
+            return f" — dica: {hint}"
+    return ""
+
+
 def clean_stderr(text, limit=400):
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     # Avisos inofensivos dos clientes

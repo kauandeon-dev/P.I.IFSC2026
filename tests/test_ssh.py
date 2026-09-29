@@ -1,5 +1,7 @@
-"""Túnel SSH. Requer um sshd de teste em 127.0.0.1:2222 com o usuário
-``tunel`` (senha ``SenhaSsh#1``) e as chaves em /tmp/sshkeys autorizadas."""
+"""Túnel SSH até um sshd local (127.0.0.1:2222) com o banco no próprio host.
+
+Ambiente criado por ``tests/remote/setup.sh`` (usuário ``tunel``, senha
+``SenhaSsh#1``, chaves em /tmp/sentinela-remoto/keys)."""
 
 import os
 import socket
@@ -9,8 +11,8 @@ import pytest
 
 from conftest import MARIA, PG, needs_maria, needs_pg
 
-KEY = "/tmp/sshkeys/id_ed25519"
-KEY_PROT = "/tmp/sshkeys/id_prot"
+KEY = "/tmp/sentinela-remoto/keys/ed25519"
+KEY_PROT = "/tmp/sentinela-remoto/keys/ed25519_senha"
 
 
 def _ssh_available():
@@ -79,7 +81,7 @@ def test_key_auth_and_passphrase(env):
     e = _setup(env, PG, _ssh_key())
     version, fp = e.test_connection()
     assert version.startswith("PostgreSQL")
-    e2 = _setup(env, PG, _ssh_key(KEY_PROT, "frase123"))
+    e2 = _setup(env, PG, _ssh_key(KEY_PROT, "frase-da-chave"))
     assert e2.test_connection()[0].startswith("PostgreSQL")
 
 

@@ -10,6 +10,7 @@ Cada execução gera um log detalhado (banco SQLite + arquivo em disco).
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -277,6 +278,15 @@ def db_access(conn, elog=None, info=None):
         a = dumpers.adapter_for(local)
         a.where = f"{conn.get('host') or 'localhost'}:{port} via SSH {ssh['host']}"
         yield a
+    except Exception as e:
+        # Se o túnel registrou o motivo real (porta fechada no servidor, encaminhamento
+        # proibido, queda da conexão SSH), ele é mais útil que o erro genérico do cliente.
+        if t.last_error:
+            mark_connection(False, conn["sgbd"], error=f"SSH: {t.last_error}")
+            if elog:
+                raise BackupError(f"Falha no túnel SSH: {t.last_error}") from e
+            raise tunnel.TunnelError(t.last_error) from e
+        raise
     finally:
         t.close()
 
@@ -609,7 +619,8 @@ def _stream_dump(adapter, part, policy):
 
     stderr = dumpers.clean_stderr(b"".join(c for c in err_chunks if c).decode("utf-8", "replace"))
     if rc != 0:
-        raise BackupError(f"Falha ao gerar dump: {stderr or f'código de saída {rc}'}")
+        raise BackupError(f"Falha ao gerar dump: {stderr or f'código de saída {rc}'}"
+                          f"{dumpers.hint_for(stderr)}")
     if stats["raw"] == 0:
         raise BackupError("Falha ao gerar dump: saída vazia")
     if not any(m in tail for m in DUMP_END_MARKERS):
@@ -751,12 +762,14 @@ def _perform_restore(elog, b, conn):
 
         # Cópia de segurança do estado atual, para permitir desfazer.
         elog("INFO", "Gerando cópia de segurança do estado atual do banco")
+        pre_id = None
         try:
             ctx = _begin_backup("pre-restore", conn)
             _perform_backup(*ctx)
             pre = get_backup(ctx[1])
             if pre["status"] == "success":
-                elog("OK", f"Cópia pré-restauração criada: {pre['id']}")
+                pre_id = pre["id"]
+                elog("OK", f"Cópia pré-restauração criada: {pre_id}")
             else:
                 elog("WARN", f"Não foi possível criar a cópia pré-restauração: {pre['error']}")
         except Exception as e:
@@ -771,16 +784,24 @@ def _perform_restore(elog, b, conn):
             t.start()
             broken = False
 
-            def sink(data):
+            def write(data):
                 nonlocal broken
-                if broken:
+                if broken or not data:
                     return
                 try:
                     proc.stdin.write(data)
                 except BrokenPipeError:
                     broken = True
+
+            # MariaDB: objetos (views, triggers, procedures) gravam DEFINER=`usuario`@`host`.
+            # Recriá-los com outro dono exige privilégio SUPER; removendo a cláusula, eles
+            # passam a pertencer ao usuário que restaura.
+            definer = _DefinerFilter(write) if adapter.sgbd == "mariadb" else None
+            sink = definer or write
             try:
                 iter_plaintext(b["path"], b["compressed"], b["encrypted"], sink)
+                if definer:
+                    definer.flush()
             finally:
                 try:
                     proc.stdin.close()
@@ -788,9 +809,17 @@ def _perform_restore(elog, b, conn):
                     pass
             rc = proc.wait()
             t.join(5)
-        stderr = dumpers.clean_stderr(b"".join(c for c in err_chunks if c).decode("utf-8", "replace"))
-        if rc != 0 or broken:
-            raise BackupError(f"Falha ao aplicar o dump: {stderr or f'código de saída {rc}'}")
+            stderr = dumpers.clean_stderr(
+                b"".join(c for c in err_chunks if c).decode("utf-8", "replace"))
+            if rc != 0 or broken:
+                hint = ""
+                if adapter.sgbd == "mariadb" and pre_id:
+                    hint = (f" — o MariaDB não restaura de forma atômica; o banco pode ter ficado "
+                            f"parcial. Para voltar ao estado anterior, restaure a cópia {pre_id}")
+                raise BackupError(f"Falha ao aplicar o dump: {stderr or f'código de saída {rc}'}"
+                                  f"{dumpers.hint_for(stderr)}{hint}")
+            if definer and definer.count:
+                elog("INFO", f"{definer.count} cláusula(s) DEFINER ajustada(s) para o usuário da restauração")
         elog("OK", f"Restauração concluída em {fmt_duration(time.monotonic() - t0)}")
         elog.finish("success")
     except Exception as e:
@@ -799,6 +828,46 @@ def _perform_restore(elog, b, conn):
         elog.finish("error")
         if not isinstance(e, (BackupError, crypto.IntegrityError, dumpers.ToolNotFound)):
             log.exception("Detalhes do erro")
+
+
+class _DefinerFilter:
+    """Remove ``DEFINER=`u`@`h``` do SQL em fluxo, linha a linha."""
+
+    # Só em comandos de criação (CREATE DEFINER=... / comentários versionados
+    # /*!50017 DEFINER=... */), nunca em linhas de dados (INSERT).
+    RX = re.compile(rb"(?<=CREATE )DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`\s?"
+                    rb"|(?<=/\*!\d{5} )DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`\s?")
+
+    def __init__(self, out):
+        self.out = out
+        self.buf = b""
+        self.count = 0
+
+    def _emit(self, chunk):
+        if b"DEFINER=" in chunk:
+            lines = chunk.split(b"\n")
+            for i, line in enumerate(lines):
+                if b"DEFINER=" in line and not line.startswith(b"INSERT INTO"):
+                    lines[i], n = self.RX.subn(b"", line)
+                    self.count += n
+            chunk = b"\n".join(lines)
+        self.out(chunk)
+
+    def __call__(self, data):
+        self.buf += data
+        cut = self.buf.rfind(b"\n")
+        if cut < 0:
+            if len(self.buf) > 64 * 1024 * 1024:  # linha gigante (INSERT): repassa
+                self.out(self.buf)
+                self.buf = b""
+            return
+        chunk, self.buf = self.buf[:cut + 1], self.buf[cut + 1:]
+        self._emit(chunk)
+
+    def flush(self):
+        if self.buf:
+            self._emit(self.buf)
+            self.buf = b""
 
 
 # =================================================================== retenção
